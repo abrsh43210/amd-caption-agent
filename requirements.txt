@@ -1,0 +1,7 @@
+streamlit==1.54.0
+openai==2.27.0
+pydantic==2.12.5
+python-dotenv==1.1.1
+moviepy==1.0.3
+watchdog==6.0.0
+faster-whisper==1.2.1
