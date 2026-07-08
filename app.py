@@ -7,6 +7,7 @@ Streamlit dashboard for MP4 upload, audio extraction, and multi-agent caption ge
 from __future__ import annotations
 
 import logging
+import time
 import traceback
 from pathlib import Path
 
@@ -110,6 +111,40 @@ CUSTOM_CSS = """
         border-radius: 9999px;
         font-size: 0.85rem;
         font-weight: 600;
+    }
+    .transcript-scroll {
+        max-height: 220px;
+        overflow-y: auto;
+        border-radius: 8px;
+        background: #111827;
+        padding: 0.75rem 1rem;
+        font-size: 0.92rem;
+        line-height: 1.7;
+        color: #d1d5db;
+        border: 1px solid #374151;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+    .transcript-scroll::-webkit-scrollbar {
+        width: 6px;
+    }
+    .transcript-scroll::-webkit-scrollbar-thumb {
+        background: #4b5563;
+        border-radius: 3px;
+    }
+    .metric-inline {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        background: #1f2937;
+        border: 1px solid #374151;
+        border-radius: 6px;
+        padding: 0.2rem 0.6rem;
+        font-size: 0.82rem;
+        color: #6ee7b7;
+        font-weight: 600;
+        vertical-align: middle;
+        margin-left: 0.5rem;
     }
 </style>
 """
@@ -322,7 +357,38 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
                 if audio_path and not transcript:
                     st.write("**[2/5] 🎵 Transcribing audio via Whisper…**")
                     try:
-                        transcript, stt_backend = transcribe_audio(audio_path, api_key=api_key)
+                        # --- Primary: Fireworks cloud Whisper ---
+                        from audio_transcriber import (
+                            _fireworks_audio_unavailable,
+                            _resolve_api_key,
+                            transcribe_with_fireworks,
+                            transcribe_with_local_whisper,
+                        )
+                        resolved_key = _resolve_api_key(api_key)
+                        try:
+                            transcript = transcribe_with_fireworks(
+                                audio_path, api_key=resolved_key
+                            )
+                            stt_backend = "fireworks-whisper-v3"
+                            if not transcript:
+                                raise ValueError("Fireworks Whisper returned an empty transcript.")
+                        except Exception as fw_exc:
+                            if not _fireworks_audio_unavailable(fw_exc):
+                                # Hard failure — not a connection/auth/deprecation issue
+                                raise RuntimeError(f"Speech-to-text failed: {fw_exc}") from fw_exc
+
+                            # --- Fallback: local faster-whisper on CPU ---
+                            logger.warning(
+                                "Fireworks audio unavailable (%s) — routing to local Whisper.",
+                                fw_exc,
+                            )
+                            _t0 = time.perf_counter()
+                            transcript = transcribe_with_local_whisper(audio_path)
+                            _elapsed = time.perf_counter() - _t0
+                            stt_backend = "local-whisper-base"
+                            if not transcript:
+                                raise ValueError("Local Whisper returned an empty transcript.")
+
                         if transcript:
                             st.success(
                                 f"Transcription complete ({len(transcript.split())} words) "
@@ -330,11 +396,10 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
                             )
                             if stt_backend == "local-whisper-base":
                                 st.info(
-                                    "Fireworks serverless audio was unavailable (deprecated June 2026). "
-                                    "Used local Whisper on CPU instead."
+                                    "Fireworks serverless audio was unavailable — "
+                                    "used local Whisper on CPU instead. "
+                                    f"⏱ Execution time: **{_elapsed:.1f}s**"
                                 )
-                        else:
-                            raise ValueError("Whisper returned an empty transcript.")
                     except Exception as exc:
                         st.warning(f"Transcription failed: {exc}")
                         if use_mock:
@@ -361,6 +426,7 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
                 st.code(traceback.format_exc())
                 status.update(label="Pipeline failed at step 2", state="error")
                 st.stop()
+
 
             # Step 3 — Analyze context
             try:
@@ -407,7 +473,9 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
             status.update(label="Pipeline complete", state="complete")
 
         with st.expander("Transcript", expanded=False):
-            st.markdown(transcript)
+            # Stats row + full-width code block (Streamlit's st.code includes a native copy button)
+            st.caption(f"{len(transcript.split())} words · {len(transcript)} characters")
+            st.code(transcript, language=None)
 
         with st.expander("Context analysis", expanded=False):
             st.markdown(context)

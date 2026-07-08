@@ -31,11 +31,35 @@ def build_transcription_client(api_key: str) -> OpenAI:
 
 
 def _fireworks_audio_unavailable(exc: Exception) -> bool:
-    """Fireworks deprecated serverless audio in June 2026; returns 401 for all requests."""
+    """Return True for any failure that should route to the local Whisper fallback.
+
+    Covers:
+    - Fireworks deprecated serverless audio (June 2026) — HTTP 401/403/404/410
+    - Network / connection failures (DNS, TCP, proxy, timeout)
+    """
     if isinstance(exc, APIStatusError) and exc.status_code in {401, 403, 404, 410}:
         return True
+    # httpx (used by the OpenAI SDK) raises httpx.ConnectError for network failures.
+    # Catch by type name so we don't need a hard httpx import here.
+    exc_type = type(exc).__name__
+    if exc_type in {"ConnectError", "ConnectTimeout", "RemoteProtocolError", "ReadTimeout"}:
+        return True
     message = str(exc).lower()
-    return "unauthorized" in message or "not found" in message
+    return any(
+        token in message
+        for token in (
+            "unauthorized",
+            "not found",
+            "connection",
+            "connect",
+            "network",
+            "timeout",
+            "refused",
+            "unreachable",
+            "name or service not known",
+            "failed to establish",
+        )
+    )
 
 
 @lru_cache(maxsize=1)
