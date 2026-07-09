@@ -1,4 +1,4 @@
-"""Video audio extraction utilities using MoviePy."""
+"""Video audio extraction and frame-extraction utilities using MoviePy."""
 
 from __future__ import annotations
 
@@ -122,3 +122,58 @@ def cleanup_temp_files(*paths: str | None) -> None:
     """Remove one or more temporary files (e.g. extracted MP3) after processing."""
     for path in paths:
         cleanup_audio_file(path)
+
+
+def extract_midpoint_frame(
+    video_path: str | Path,
+    output_image_path: str | Path,
+) -> tuple[str | None, str | None]:
+    """
+    Extract the frame at the video's midpoint and save it as a JPEG.
+
+    Parameters
+    ----------
+    video_path:
+        Path to the source video file.
+    output_image_path:
+        Destination path for the output JPEG.
+
+    Returns
+    -------
+    (output_path, None) on success; (None, error_message) on failure.
+    """
+    try:
+        from moviepy.editor import VideoFileClip
+        from PIL import Image
+        import numpy as np
+
+        video_path = Path(video_path)
+        if not video_path.exists():
+            return None, f"Video file not found: {video_path}"
+
+        clip = None
+        try:
+            clip = VideoFileClip(str(video_path))
+            if clip.duration is None or clip.duration <= 0:
+                return None, "Video has zero or unknown duration; cannot extract midpoint frame."
+
+            midpoint = clip.duration / 2.0
+            frame: np.ndarray = clip.get_frame(midpoint)  # shape (H, W, 3), dtype uint8
+
+            image = Image.fromarray(frame, mode="RGB")
+            output_image_path = Path(output_image_path)
+            output_image_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(str(output_image_path), format="JPEG", quality=85)
+
+            logger.info(
+                "Midpoint frame (t=%.2fs) saved to %s", midpoint, output_image_path
+            )
+            return str(output_image_path), None
+
+        finally:
+            if clip is not None:
+                clip.close()
+
+    except Exception as exc:
+        logger.warning("extract_midpoint_frame failed for %s: %s", video_path, exc)
+        return None, f"Frame extraction failed: {exc}"
