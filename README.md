@@ -22,21 +22,25 @@ A production-ready Streamlit application that ingests MP4 video, transcribes spe
 ```mermaid
 flowchart TB
     subgraph Input
-        MP4[MP4 Upload]
+        MP4["MP4 Upload / URL"]
     end
 
     subgraph Step1["1 · Local Audio Extraction"]
-        VP[video_processor.py<br/>MoviePy → MP3]
+        VP["video_processor.py\nMoviePy → MP3"]
     end
 
-    subgraph Step2["2 · Speech-to-Text"]
-        FW[Fireworks Whisper-v3<br/>cloud-first]
-        LW[faster-whisper base<br/>CPU fallback]
-        FW -.->|401 / deprecated| LW
+    subgraph Step2["2 · Speech-to-Text (4-tier fallback)"]
+        FW["① Fireworks Whisper-v3\ncloud-first"]
+        LW["② faster-whisper base\nCPU fallback"]
+        VLM["③ Llama 3.2-Vision VLM\nmidpoint frame → description"]
+        SB["④ Static silent baseline\nlast resort"]
+        FW -.->|"401 / deprecated"| LW
+        LW -.->|"empty transcript"| VLM
+        VLM -.->|"vision error"| SB
     end
 
     subgraph Step3["3 · Context Analysis"]
-        CTX[generate_raw_context<br/>GPT-OSS via Fireworks]
+        CTX["generate_raw_context\nGPT-OSS via Fireworks"]
     end
 
     subgraph Step4["4 · Multi-Agent Style Orchestration"]
@@ -47,14 +51,16 @@ flowchart TB
     end
 
     subgraph Step5["5 · Critic Verification Loop"]
-        CRIT[Critic Agent<br/>Pydantic JSON schema]
-        CRIT -->|not approved| Step4
-        CRIT -->|approved| OUT[4 Captions + Scores]
+        CRIT["Critic Agent\nPydantic JSON schema"]
+        CRIT -->|"not approved"| Step4
+        CRIT -->|"approved"| OUT["4 Captions + Scores"]
     end
 
     MP4 --> VP --> FW
     FW --> CTX
     LW --> CTX
+    VLM --> CTX
+    SB --> CTX
     CTX --> F & S & HT & HN
     F & S & HT & HN --> CRIT
 ```
@@ -64,22 +70,28 @@ flowchart TB
 | Stage | Module | Description |
 |-------|--------|-------------|
 | **1. Local Audio Extraction** | `video_processor.py` | Writes uploaded bytes to a temp file, extracts the audio track as MP3 via MoviePy, and cleans up temp files in `finally` blocks to prevent memory leaks. |
-| **2. Local faster-whisper Transcription** | `audio_transcriber.py` | Attempts Fireworks `whisper-v3` first. On 401/deprecation, automatically falls back to `faster-whisper` (`base` model, CPU, `int8`) so transcription never blocks the pipeline. |
+| **2. Speech-to-Text (4-tier)** | `audio_transcriber.py` + `run_headless.py` | Attempts Fireworks `whisper-v3` first. On 401/deprecation routes to `faster-whisper` CPU. If transcript is empty/silent, extracts the video midpoint JPEG and queries a Vision LLM for a scene description. Final last-resort: static silent baseline string. |
 | **3. Context Analysis** | `pipeline.py` | Summarizes themes, mood, technical jargon, and audience signals from the transcript using Fireworks GPT-OSS chat completions. |
 | **4. Multi-Agent Style Orchestration** | `pipeline.py` | A single structured prompt manages four copywriter personas, each producing a unique caption style aligned to Track 2 requirements. |
 | **5. Critic Verification Loop** | `pipeline.py` + `schemas.py` | The Critic Agent returns a `CriticEvaluation` (Pydantic) with tonal scores, critique notes, and an `approved` flag. Failed reviews feed feedback back into the generator for up to 3 self-correction passes. |
 
-### Hybrid Resilience Model
+### 4-Tier Transcription Fallback Architecture
 
 ```
-Cloud (Fireworks AI)          Local (CPU)
-─────────────────────         ───────────────────
-GPT-OSS 20B / 120B            MoviePy audio extract
-Context + Caption agents      faster-whisper STT
-Structured JSON critic        Temp file cleanup
+Tier 1 — Cloud STT      Fireworks Whisper-v3 (fastest, highest quality)
+    │ 401 / network error
+    ▼
+Tier 2 — Local CPU STT  faster-whisper base (int8, no GPU required)
+    │ transcript < 5 chars (silent / music-only video)
+    ▼
+Tier 3 — Vision LLM     Extract midpoint JPEG → Llama 3.2-11B Vision
+    │                    "Describe this scene in 1-2 factual sentences."
+    │ vision API error / empty response
+    ▼
+Tier 4 — Static Baseline "[Silent video detected — visual content only]"
 ```
 
-When Fireworks serverless audio was deprecated (June 2026), the pipeline detected `401 Unauthorized` and transparently routed transcription to local Whisper—**zero user intervention required**.
+This chain ensures **100% pipeline uptime** regardless of API deprecations, silent videos, or network failures.
 
 ---
 
@@ -90,9 +102,11 @@ When Fireworks serverless audio was deprecated (June 2026), the pipeline detecte
 | Language | **Python 3.11+** |
 | UI | **Streamlit** |
 | Speech-to-Text | **faster-whisper** (CPU fallback) + Fireworks Whisper-v3 (cloud-first) |
+| Vision Fallback | **Llama 3.2-11B Vision** via Fireworks AI (silent video scene description) |
 | LLM Inference | **Fireworks AI API** — OpenAI-compatible (`GPT-OSS 20B`, `GPT-OSS 120B`) |
 | Structured Output | **Pydantic v2** (`CaptionSet`, `CriticEvaluation`) |
 | Video/Audio | **MoviePy 1.0.3** + FFmpeg |
+| Image Processing | **Pillow** + **NumPy** (midpoint frame extraction for VLM fallback) |
 | HTTP Client | **OpenAI Python SDK** (sync, Streamlit-safe) |
 | Config | **python-dotenv**, `.gitignore`-protected secrets |
 
@@ -106,7 +120,9 @@ amd-caption-agent/
 ├── audio_transcriber.py   # Fireworks Whisper + faster-whisper fallback
 ├── pipeline.py            # Context analysis, personas, critic loop
 ├── schemas.py             # Pydantic models for structured outputs
-├── video_processor.py     # MP4 → MP3 extraction & cleanup
+├── video_processor.py     # MP4 → MP3 extraction, midpoint frame grab & cleanup
+├── run_headless.py        # Batch runner — reads /input/tasks.json, writes /output/results.json
+├── entrypoint.sh          # Container entry point (headless vs Streamlit routing)
 ├── requirements.txt
 ├── Dockerfile
 ├── .env                   # FIREWORKS_API_KEY (not committed)
@@ -171,9 +187,9 @@ Open **http://localhost:8501**, upload an MP4, and click **Generate Captions**.
 docker build -t amd-caption-agent .
 ```
 
-### Run the container
+### Run — Interactive Streamlit mode
 
-Pass your Fireworks key at runtime—do not bake secrets into the image:
+Pass your Fireworks key at runtime — do not bake secrets into the image:
 
 ```bash
 docker run -p 8501:8501 -e FIREWORKS_API_KEY=fw_your_key_here amd-caption-agent
@@ -181,10 +197,59 @@ docker run -p 8501:8501 -e FIREWORKS_API_KEY=fw_your_key_here amd-caption-agent
 
 Open **http://localhost:8501**.
 
-### Optional: mount a local `.env` file
+```bash
+# Or mount a local .env file
+docker run -p 8501:8501 --env-file .env amd-caption-agent
+```
+
+### Run — Headless batch mode
+
+When `/input/tasks.json` is present inside the container, `entrypoint.sh` automatically routes to `run_headless.py` instead of Streamlit. Mount two local directories:
 
 ```bash
-docker run -p 8501:8501 --env-file .env amd-caption-agent
+# 1. Prepare input
+mkdir -p ./input ./output
+cat > ./input/tasks.json <<'EOF'
+[
+  { "task_id": "video1", "video_url": "https://example.com/video.mp4" },
+  { "id": "video2",    "url":       "https://example.com/other.mp4" }
+]
+EOF
+
+# 2. Run
+docker run --rm \
+  -e FIREWORKS_API_KEY=fw_your_key_here \
+  -v "$(pwd)/input:/input" \
+  -v "$(pwd)/output:/output" \
+  amd-caption-agent
+
+# 3. Results
+cat ./output/results.json
+```
+
+**`tasks.json` flexible schema** — both `task_id`/`id` and `video_url`/`url` key names are accepted.
+
+**Output format** (`/output/results.json`):
+
+```json
+{
+  "video1": {
+    "formal": "...",
+    "sarcastic": "...",
+    "humorous_tech": "...",
+    "humorous_non_tech": "..."
+  }
+}
+```
+
+Results are written **atomically after each video** via a temp-file-and-rename strategy — safe to interrupt and resume.
+
+### How the container decides which mode to run
+
+```
+entrypoint.sh
+  └─ /input/tasks.json exists?  →  python run_headless.py  (batch)
+  └─ no                         →  streamlit run app.py    (interactive)
 ```
 
 ---
@@ -208,7 +273,8 @@ docker run -p 8501:8501 --env-file .env amd-caption-agent
 | Default (fast) | `accounts/fireworks/models/gpt-oss-20b` |
 | High quality | `accounts/fireworks/models/gpt-oss-120b` |
 | STT (cloud-first) | `whisper-v3` |
-| STT (fallback) | `faster-whisper` `base` on CPU |
+| STT (CPU fallback) | `faster-whisper` `base` on CPU |
+| Vision fallback (silent video) | `accounts/fireworks/models/llama-v3p2-11b-vision-instruct` |
 
 ---
 
