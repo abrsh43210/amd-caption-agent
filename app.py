@@ -498,7 +498,7 @@ else:
     st.markdown(
         """
         1. **Extract audio** from your MP4 with MoviePy (MP3)
-        2. **Transcribe** speech via Whisper (Fireworks when available, local CPU fallback)
+        2. **Transcribe & Analyze Vision**: Transcribe speech via Whisper (Fireworks/local fallback). If the video is silent, we automatically extract a midpoint keyframe and use Fireworks LLaMA Vision to describe the scene.
         3. **Analyze context** — themes, mood, and technical jargon
         4. **Orchestrate agents** — Formal, Sarcastic, Humorous-Tech, Humorous-Non-Tech
         5. **Critic loop** — automated quality gate with up to 3 self-correction passes
