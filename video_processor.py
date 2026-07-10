@@ -198,11 +198,36 @@ def cleanup_temp_files(*paths: str | None) -> None:
         cleanup_audio_file(path)
 
 
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Client-type strategies to try in order. YouTube's default (web) client
+# frequently fails with "The page needs to be reloaded" (SABR streaming
+# rollout breaking extraction); android/ios/tv_embedded clients still
+# return playable formats without a PO token. Trying several client
+# combinations improves the odds of success on hosts YouTube treats with
+# more suspicion (cloud/datacenter IPs).
+_YT_CLIENT_STRATEGIES = [
+    ["android", "ios"],
+    ["tv_embedded", "web"],
+    ["web_safari"],
+]
+
+
 def download_video(url: str, max_bytes: int = 500 * 1024 * 1024) -> str:
     """
     Download a video from a YouTube link or a direct video file URL to a temp
     MP4 file using yt-dlp (which also handles plain file URLs via its
     generic extractor).
+
+    For YouTube URLs, tries several player-client strategies in sequence
+    since YouTube's extraction behavior varies by source IP and changes
+    frequently; if every strategy fails the final, most-informative error
+    is raised (frequently caused by YouTube blocking the calling IP —
+    common for cloud-hosted deployments — rather than a genuinely
+    unavailable video).
 
     Returns the path to the downloaded MP4. Caller is responsible for
     cleanup via cleanup_audio_file/cleanup_temp_files.
@@ -213,35 +238,47 @@ def download_video(url: str, max_bytes: int = 500 * 1024 * 1024) -> str:
     os.close(fd)
     os.remove(path)  # yt-dlp writes to this exact path via outtmpl
 
-    ydl_opts = {
-        "format": "mp4/best[ext=mp4]/best",
-        "outtmpl": path,
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "max_filesize": max_bytes,
-        # YouTube's default (web) client frequently fails to return playable
-        # formats ("The page needs to be reloaded" / SABR streaming errors).
-        # The android/ios clients still work without needing a PO token.
-        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
-    }
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+    strategies = _YT_CLIENT_STRATEGIES if is_youtube else [None]
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as exc:
-        if os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        raise RuntimeError(f"Failed to download video from {url}: {exc}") from exc
+    last_exc: Exception | None = None
+    for player_clients in strategies:
+        ydl_opts: dict = {
+            "format": "mp4/best[ext=mp4]/best",
+            "outtmpl": path,
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "max_filesize": max_bytes,
+            "http_headers": {"User-Agent": _BROWSER_USER_AGENT},
+        }
+        if player_clients:
+            ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
 
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        raise RuntimeError(f"Download produced no output file for {url}")
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                return path
+            last_exc = RuntimeError("Download produced no output file.")
+        except Exception as exc:
+            last_exc = exc
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            continue
 
-    return path
+    hint = (
+        " This is commonly caused by YouTube blocking cloud-hosted server IPs "
+        "rather than the video actually being unavailable — try a direct video "
+        "file URL instead if this persists."
+        if is_youtube
+        else ""
+    )
+    raise RuntimeError(f"Failed to download video from {url}: {last_exc}.{hint}") from last_exc
 
 
 def extract_midpoint_frame(
