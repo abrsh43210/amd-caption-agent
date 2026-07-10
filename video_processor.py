@@ -241,6 +241,20 @@ def download_video(url: str, max_bytes: int = 500 * 1024 * 1024) -> str:
     is_youtube = "youtube.com" in url or "youtu.be" in url
     strategies = _YT_CLIENT_STRATEGIES if is_youtube else [None]
 
+    # Optional proxy for hosts YouTube blocklists at the IP level (e.g.
+    # Streamlit Community Cloud). Must be a residential/mobile proxy —
+    # datacenter proxies are blocked by YouTube the same way cloud-host IPs
+    # are, so they won't help here. Read from env first, falling back to
+    # Streamlit secrets so it can be set without touching source or .env.
+    proxy_url = os.getenv("YTDLP_PROXY_URL", "").strip()
+    if not proxy_url:
+        try:
+            import streamlit as st
+
+            proxy_url = str(st.secrets.get("YTDLP_PROXY_URL", "")).strip()
+        except Exception:
+            proxy_url = ""
+
     last_exc: Exception | None = None
     for player_clients in strategies:
         ydl_opts: dict = {
@@ -255,6 +269,8 @@ def download_video(url: str, max_bytes: int = 500 * 1024 * 1024) -> str:
         }
         if player_clients:
             ydl_opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+        if proxy_url:
+            ydl_opts["proxy"] = proxy_url
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
