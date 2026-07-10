@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import tenacity\")",
+      "Bash(python3 -c \"import openai; print\\(openai.__version__\\)\")",
+      "Bash(pip show *)",
+      "WebFetch(domain:lablab.ai)"
+    ]
+  }
+}
