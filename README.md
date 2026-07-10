@@ -13,7 +13,11 @@ A production-ready Streamlit application that ingests MP4 video, transcribes spe
 | **What** | An end-to-end video captioning pipeline that extracts audio from uploaded MP4 files, transcribes speech, analyzes context, and generates four tonal caption variants (Formal, Sarcastic, Humorous-Tech, Humorous-Non-Tech) with automated quality guardrails. |
 | **Why** | Video creators and hackathon participants need fast, reliable, multi-style captions without manual copywriting. Cloud APIs can change or deprecate overnight—this project delivers consistent output through a hybrid cloud + local architecture. |
 | **Who** | Developers, content creators, marketing teams, and hackathon judges evaluating Track 2 submissions who want demonstrable multi-agent AI with real-world resilience. |
-| **How** | MoviePy extracts audio locally → Whisper transcribes (Fireworks API with CPU fallback) → Fireworks GPT-OSS models run context analysis and persona-based caption generation → a Pydantic-structured Critic Agent scores, critiques, and self-corrects up to N retries—all surfaced through a polished Streamlit dashboard. |
+| **How** | MoviePy extracts audio locally → Whisper transcribes (Fireworks API with CPU fallback) → **frames sampled across the whole video are always described by a Vision LLM and fused with the transcript** → Fireworks GPT-OSS models run context analysis and persona-based caption generation → a Pydantic-structured Critic Agent scores, critiques, and self-corrects up to N retries—all surfaced through a polished Streamlit dashboard. |
+
+### What sets this apart: Audio + Vision Fusion (not just a silent-video fallback)
+
+Most captioning pipelines only look at the video when audio fails. This one **always** samples 3 evenly-spaced frames across the clip and asks a Vision LLM to describe the visual content, then fuses that description with the transcript before context analysis runs — so captions can reference what's actually on screen (setting, on-screen text/UI, action) even when narration alone wouldn't reveal it. This runs alongside, not instead of, the 4-tier STT fallback below, and is best-effort: if frame sampling or the vision call fails, the pipeline silently continues with transcript-only context.
 
 ---
 
@@ -39,8 +43,10 @@ flowchart TB
         VLM -.->|"vision error"| SB
     end
 
-    subgraph Step3["3 · Context Analysis"]
-        CTX["generate_raw_context\nGPT-OSS via Fireworks"]
+    subgraph Step3["3 · Context Analysis (Audio + Vision Fusion)"]
+        VIS["get_visual_context\n3 sampled frames -> Vision LLM\n(always-on, best-effort)"]
+        CTX["generate_raw_context\nGPT-OSS via Fireworks\n(transcript + visual description)"]
+        VIS --> CTX
     end
 
     subgraph Step4["4 · Multi-Agent Style Orchestration"]
@@ -71,7 +77,7 @@ flowchart TB
 |-------|--------|-------------|
 | **1. Local Audio Extraction** | `video_processor.py` | Writes uploaded bytes to a temp file, extracts the audio track as MP3 via MoviePy, and cleans up temp files in `finally` blocks to prevent memory leaks. |
 | **2. Speech-to-Text (4-tier)** | `audio_transcriber.py` + `run_headless.py` | Attempts Fireworks `whisper-v3` first. On 401/deprecation routes to `faster-whisper` CPU. If transcript is empty/silent, extracts the video midpoint JPEG and queries a Vision LLM for a scene description. Final last-resort: static silent baseline string. |
-| **3. Context Analysis** | `pipeline.py` | Summarizes themes, mood, technical jargon, and audience signals from the transcript using Fireworks GPT-OSS chat completions. |
+| **3. Context Analysis (Audio + Vision Fusion)** | `audio_transcriber.py::get_visual_context` + `pipeline.py::generate_raw_context` | Always samples 3 evenly-spaced frames across the video and describes them with the Vision LLM, then fuses that with the transcript before summarizing themes, mood, technical jargon, and audience signals via Fireworks GPT-OSS. Best-effort — falls back to transcript-only context if frame sampling/vision fails. |
 | **4. Multi-Agent Style Orchestration** | `pipeline.py` | A single structured prompt manages four copywriter personas, each producing a unique caption style aligned to Track 2 requirements. |
 | **5. Critic Verification Loop** | `pipeline.py` + `schemas.py` | The Critic Agent returns a `CriticEvaluation` (Pydantic) with tonal scores, critique notes, and an `approved` flag. Failed reviews feed feedback back into the generator for up to 3 self-correction passes. |
 
@@ -92,6 +98,8 @@ Tier 4 — Static Baseline "[Silent video detected — visual content only]"
 ```
 
 This chain ensures **100% pipeline uptime** regardless of API deprecations, silent videos, or network failures.
+
+> **Note:** Tier 3 above is a single midpoint-frame fallback used only when speech transcription comes back empty. It's separate from the **always-on, multi-frame Audio + Vision Fusion** step (3 frames sampled across the whole clip) described below, which runs for every video regardless of transcription success.
 
 ---
 
@@ -123,9 +131,14 @@ amd-caption-agent/
 ├── video_processor.py     # MP4 → MP3 extraction, midpoint frame grab & cleanup
 ├── run_headless.py        # Batch runner — reads /input/tasks.json, writes /output/results.json
 ├── entrypoint.sh          # Container entry point (headless vs Streamlit routing)
+├── scripts/
+│   ├── build_and_push.sh      # Build + push a public linux/amd64 image for the judging harness
+│   └── smoke_test_harness.sh  # Local end-to-end test mimicking the Track 2 harness
 ├── requirements.txt
 ├── Dockerfile
 ├── .env                   # FIREWORKS_API_KEY (not committed)
+├── .env.example
+├── LICENSE
 └── .gitignore
 ```
 
@@ -252,6 +265,27 @@ entrypoint.sh
   └─ no                         →  streamlit run app.py    (interactive)
 ```
 
+### Publishing a public `linux/amd64` image for judging
+
+Track 2's harness pulls a **public, `linux/amd64`** image and runs the same tasks.json → results.json flow shown above. Building without an explicit platform flag on Apple Silicon produces an `arm64` image the harness can't run — use the provided script instead of a plain `docker build`:
+
+```bash
+IMAGE=yourdockerhubuser/amd-caption-agent TAG=latest ./scripts/build_and_push.sh
+```
+
+This builds for `linux/amd64` via `docker buildx` and pushes to your registry. Verify it's actually public by pulling it logged out: `docker logout && docker pull yourdockerhubuser/amd-caption-agent:latest`.
+
+### Local harness smoke test
+
+Before submitting, verify the exact harness flow end-to-end against a real video URL:
+
+```bash
+FIREWORKS_API_KEY=fw_your_key_here VIDEO_URL=https://example.com/short-clip.mp4 \
+  ./scripts/smoke_test_harness.sh
+```
+
+This builds the `linux/amd64` image, runs it with harness-shaped `/input` and `/output` mounts, and asserts `results.json` contains all four non-empty caption styles for each task.
+
 ---
 
 ## Configuration (Sidebar)
@@ -303,6 +337,10 @@ entrypoint.sh
 ---
 
 ## Why This Project Wins
+
+### 0. Audio + Vision Fusion — Always On
+
+Nearly every competing submission only looks at video frames when audio fails (silent-video fallback). This pipeline samples frames across the **entire** clip and fuses a Vision-LLM description into context analysis for *every* video, whether or not speech transcription succeeded. Captions can therefore reflect on-screen text, UI, setting, and action that narration alone never mentions — a meaningfully more accurate, "actually watched the video" result, not just a transcript rephrased four ways.
 
 ### 1. Critic Agent Guardrails
 

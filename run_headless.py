@@ -12,7 +12,6 @@ Environment:
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -35,14 +34,15 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Project imports (after env is populated)
 # ---------------------------------------------------------------------------
-from audio_transcriber import transcribe_audio
+from audio_transcriber import get_visual_context, transcribe_with_vision_fallback
 from pipeline import (
     build_client,
     generate_raw_context,
     resolve_fireworks_api_key,
     run_caption_critic_loop,
 )
-from video_processor import cleanup_temp_files, extract_midpoint_frame, safe_extract_audio
+from schemas import TelemetrySummary
+from video_processor import cleanup_temp_files, validate_duration
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -61,18 +61,8 @@ logger = logging.getLogger("run_headless")
 INPUT_TASKS_PATH = Path("/input/tasks.json")
 OUTPUT_RESULTS_PATH = Path("/output/results.json")
 
-# Fallback transcript used when a video has no audible speech AND vision
-# description also fails, so caption generation never crashes.
-SILENT_VIDEO_BASELINE = (
-    "[Silent video detected — no audible speech. "
-    "Visual content only; captions based on contextual inference.]"
-)
-
-# Fireworks vision model used for silent-video scene description.
-VISION_MODEL = "accounts/fireworks/models/llama-v3p2-11b-vision-instruct"
-
-# Minimum character length below which a transcript is considered empty/silent.
-_MIN_TRANSCRIPT_CHARS = 5
+# Maximum bytes to download for a single video (default 500MB, overridable).
+MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(500 * 1024 * 1024)))
 
 
 # ---------------------------------------------------------------------------
@@ -159,12 +149,44 @@ def _extract_task_fields(task: dict[str, Any], index: int) -> tuple[str, str] | 
 def _download_video(url: str) -> str:
     """Download *url* to a temporary MP4 file and return its path.
 
+    Enforces a connect/read timeout and a maximum download size
+    (MAX_DOWNLOAD_BYTES) to avoid hanging or unbounded downloads.
     The caller is responsible for deleting the file when done.
     """
     fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
     logger.info("Downloading video: %s -> %s", url, tmp_path)
-    urllib.request.urlretrieve(url, tmp_path)
+
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_DOWNLOAD_BYTES:
+                raise RuntimeError(
+                    f"Video at {url} declares {content_length} bytes, "
+                    f"exceeding MAX_DOWNLOAD_BYTES ({MAX_DOWNLOAD_BYTES})."
+                )
+
+            downloaded = 0
+            chunk_size = 1024 * 1024
+            with open(tmp_path, "wb") as out_file:
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > MAX_DOWNLOAD_BYTES:
+                        raise RuntimeError(
+                            f"Video at {url} exceeded MAX_DOWNLOAD_BYTES "
+                            f"({MAX_DOWNLOAD_BYTES}) during download; aborting."
+                        )
+                    out_file.write(chunk)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
     return tmp_path
 
 
@@ -205,55 +227,6 @@ def _write_results_atomic(results: dict[str, Any]) -> None:
         raise
 
 
-def _describe_frame_with_vision(image_path: str, *, api_key: str) -> str | None:
-    """Send a JPEG frame to the Fireworks vision model and return a scene description.
-
-    Returns the description string on success, or None if anything goes wrong
-    (the caller must then fall back to SILENT_VIDEO_BASELINE).
-    """
-    try:
-        with open(image_path, "rb") as img_file:
-            b64_image = base64.b64encode(img_file.read()).decode("utf-8")
-
-        from pipeline import build_client  # already imported at module level, re-use
-        client = build_client(api_key)
-
-        response = client.chat.completions.create(
-            model=VISION_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{b64_image}",
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                "Describe what is happening in this video scene "
-                                "in 1-2 detailed, factual sentences."
-                            ),
-                        },
-                    ],
-                }
-            ],
-            max_tokens=256,
-            temperature=0.3,
-        )
-        description = (response.choices[0].message.content or "").strip()
-        if description:
-            logger.info("Vision description obtained (%d chars).", len(description))
-            return description
-        logger.warning("Vision model returned an empty description.")
-        return None
-    except Exception as exc:
-        logger.warning("Vision description failed: %s", exc)
-        return None
-
-
 def _merge_and_persist(task_id: str, caption_data: dict[str, str]) -> None:
     """Merge one task's result into the output file and save atomically."""
     results = _read_results()
@@ -269,98 +242,57 @@ def _merge_and_persist(task_id: str, caption_data: dict[str, str]) -> None:
 def _process_task(task_id: str, video_url: str, *, api_key: str) -> dict[str, str]:
     """Download, transcribe, and caption one video.  Returns the caption dict."""
     video_path: str | None = None
-    audio_path: str | None = None
-    frame_path: str | None = None
+    telemetry = TelemetrySummary()
 
     try:
         # 1. Download video
         video_path = _download_video(video_url)
 
-        # 2. Extract audio
-        logger.info("[%s] Extracting audio...", task_id)
-        with open(video_path, "rb") as vf:
-            video_bytes = vf.read()
+        # 2. Validate duration against the Track 2 30s-2min compliance window
+        is_valid, duration_msg = validate_duration(video_path)
+        if duration_msg:
+            log_fn = logger.info if is_valid else logger.warning
+            log_fn("[%s] %s", task_id, duration_msg)
 
-        audio_path, audio_error = safe_extract_audio(video_bytes)
-        if audio_error:
-            logger.warning(
-                "[%s] Audio extraction failed: %s. Using silent baseline.", task_id, audio_error
-            )
+        # 3. Transcribe with the full 4-tier fallback (Fireworks -> local Whisper ->
+        #    vision -> static baseline); truncates processing to the first 120s.
+        logger.info("[%s] Transcribing (with vision fallback)...", task_id)
+        transcript, backend = transcribe_with_vision_fallback(video_path, api_key)
+        logger.info(
+            "[%s] Transcription via '%s': %d chars.", task_id, backend, len(transcript)
+        )
 
-        # 3. Transcribe
-        transcript = ""
-        if audio_path:
-            logger.info("[%s] Transcribing audio...", task_id)
-            try:
-                transcript, backend = transcribe_audio(audio_path, api_key=api_key)
-                logger.info(
-                    "[%s] Transcription via '%s': %d chars.", task_id, backend, len(transcript)
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[%s] Transcription error: %s. Using silent baseline.", task_id, exc
-                )
+        # 4. Visual grounding — always sample a few frames so captions reflect
+        #    what's actually on screen, not just the transcript (best-effort;
+        #    never blocks the pipeline on failure).
+        logger.info("[%s] Sampling frames for visual grounding...", task_id)
+        visual_context = get_visual_context(video_path, api_key)
+        logger.info(
+            "[%s] Visual context: %s", task_id, "obtained" if visual_context else "unavailable"
+        )
 
-        # Gracefully handle silent / untranscribable video
-        if len(transcript.strip()) < _MIN_TRANSCRIPT_CHARS:
-            logger.warning(
-                "[%s] Transcript too short (%d chars); attempting vision fallback.",
-                task_id,
-                len(transcript.strip()),
-            )
-            visual_description: str | None = None
-            try:
-                # Extract the midpoint frame from the downloaded video
-                fd, frame_tmp = tempfile.mkstemp(suffix=".jpg")
-                os.close(fd)
-                frame_path = frame_tmp
-
-                saved_frame, frame_err = extract_midpoint_frame(video_path, frame_path)
-                if frame_err or not saved_frame:
-                    logger.warning(
-                        "[%s] Frame extraction failed: %s", task_id, frame_err
-                    )
-                else:
-                    visual_description = _describe_frame_with_vision(
-                        saved_frame, api_key=api_key
-                    )
-            except Exception as vision_exc:
-                logger.warning(
-                    "[%s] Vision fallback raised an unexpected error: %s",
-                    task_id,
-                    vision_exc,
-                )
-
-            if visual_description:
-                logger.info(
-                    "[%s] Using vision-derived description as transcript baseline.",
-                    task_id,
-                )
-                transcript = visual_description
-            else:
-                logger.warning(
-                    "[%s] Vision fallback unavailable; using static silent baseline.",
-                    task_id,
-                )
-                transcript = SILENT_VIDEO_BASELINE
-
-        # 4. Context generation
+        # 5. Context generation
         logger.info("[%s] Generating context summary...", task_id)
         client = build_client(api_key)
-        context = generate_raw_context(transcript, client=client)
+        context, context_telemetry = generate_raw_context(
+            transcript, client=client, visual_context=visual_context
+        )
+        telemetry += context_telemetry
         logger.info("[%s] Context summary (%d chars) ready.", task_id, len(context))
 
-        # 5. Self-correcting critic loop
+        # 6. Self-correcting critic loop
         logger.info("[%s] Running caption critic loop...", task_id)
-        evaluation = run_caption_critic_loop(transcript, context, client=client)
+        evaluation, critic_telemetry = run_caption_critic_loop(transcript, context, client=client)
+        telemetry += critic_telemetry
         logger.info(
-            "[%s] Critic loop finished. Approved=%s, scores=%s",
+            "[%s] Critic loop finished. Approved=%s, scores=%s, total_tokens=%d",
             task_id,
             evaluation.approved,
             evaluation.tonal_scores,
+            telemetry.total_tokens,
         )
 
-        # 6. Build output dict
+        # 7. Build output dict
         captions = evaluation.captions
         return {
             "formal": captions.formal,
@@ -370,12 +302,9 @@ def _process_task(task_id: str, video_url: str, *, api_key: str) -> dict[str, st
         }
 
     finally:
-        # 7. Cleanup temporary files
+        # 8. Cleanup temporary files
         logger.info("[%s] Cleaning up temporary files.", task_id)
-        files_to_remove: list[str | None] = [audio_path, frame_path]
-        if video_path:
-            files_to_remove.append(video_path)
-        cleanup_temp_files(*files_to_remove)
+        cleanup_temp_files(video_path)
 
 
 # ---------------------------------------------------------------------------

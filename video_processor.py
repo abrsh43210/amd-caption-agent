@@ -29,9 +29,16 @@ def temp_audio_path(suffix: str = AUDIO_SUFFIX) -> Generator[str, None, None]:
             logger.warning("Failed to remove temp audio file %s: %s", path, exc)
 
 
-def extract_audio_from_video(video_path: str | Path, output_path: str | Path | None = None) -> str:
+def extract_audio_from_video(
+    video_path: str | Path,
+    output_path: str | Path | None = None,
+    max_duration: float | None = None,
+) -> str:
     """
     Extract the audio track from an MP4 (or other video) file.
+
+    If *max_duration* is set and the clip is longer, only the first
+    *max_duration* seconds are extracted (Track 2's 2-minute processing cap).
 
     Returns the path to the extracted audio file. Caller is responsible for
     cleanup when *output_path* is not provided (a temp file is created).
@@ -55,7 +62,11 @@ def extract_audio_from_video(video_path: str | Path, output_path: str | Path | N
         if clip.audio is None:
             raise ValueError("Video has no audio track.")
 
-        clip.audio.write_audiofile(
+        audio = clip.audio
+        if max_duration is not None and clip.duration and clip.duration > max_duration:
+            audio = clip.subclip(0, max_duration).audio
+
+        audio.write_audiofile(
             output_path,
             fps=44100,
             codec="libmp3lame",
@@ -75,25 +86,34 @@ def extract_audio_from_video(video_path: str | Path, output_path: str | Path | N
             clip.close()
 
 
-def safe_extract_audio(video_bytes: bytes, suffix: str = ".mp4") -> tuple[str | None, str | None]:
+def safe_extract_audio(
+    video_bytes: bytes,
+    suffix: str = ".mp4",
+    max_duration: float | None = None,
+) -> tuple[str | None, str | None, float | None]:
     """
     Write uploaded bytes to a temp video file, extract audio, and clean up the video.
 
-    Returns (audio_path, error_message). On success error_message is None.
-    The caller must delete audio_path when finished.
+    Returns (audio_path, error_message, original_duration_seconds). On success
+    error_message is None. The caller must delete audio_path when finished.
     """
     video_fd, video_path = tempfile.mkstemp(suffix=suffix)
     os.close(video_fd)
     audio_path: str | None = None
+    duration: float | None = None
 
     try:
         with open(video_path, "wb") as video_file:
             video_file.write(video_bytes)
 
-        audio_path = extract_audio_from_video(video_path)
-        return audio_path, None
+        duration, duration_err = _clip_duration(video_path)
+        if duration_err:
+            logger.warning("Could not read video duration: %s", duration_err)
+
+        audio_path = extract_audio_from_video(video_path, max_duration=max_duration)
+        return audio_path, None, duration
     except ValueError as exc:
-        return None, str(exc)
+        return None, str(exc), duration
     except Exception as exc:
         logger.exception("Audio extraction failed")
         if audio_path and os.path.exists(audio_path):
@@ -101,12 +121,66 @@ def safe_extract_audio(video_bytes: bytes, suffix: str = ".mp4") -> tuple[str | 
                 os.remove(audio_path)
             except OSError:
                 pass
-        return None, f"Audio extraction failed: {exc}"
+        return None, f"Audio extraction failed: {exc}", duration
     finally:
         try:
             os.remove(video_path)
         except OSError:
             pass
+
+
+def _clip_duration(video_path: str | Path) -> tuple[float | None, str | None]:
+    """Return (duration_seconds, error_message) for a video file."""
+    from moviepy.editor import VideoFileClip
+
+    clip = None
+    try:
+        clip = VideoFileClip(str(video_path))
+        return clip.duration, None
+    except Exception as exc:
+        return None, str(exc)
+    finally:
+        if clip is not None:
+            clip.close()
+
+
+def duration_verdict(
+    duration: float, min_sec: int = 30, max_sec: int = 120
+) -> tuple[bool, str | None]:
+    """
+    Judge a clip duration against Track 2's 30s-2min compliance window.
+
+    Returns (is_valid, message). Too-short clips are flagged invalid (callers
+    may still choose to process them with a warning). Too-long clips are
+    still considered valid but come with a truncation notice; callers should
+    only process the first *max_sec* seconds.
+    """
+    if duration < min_sec:
+        return False, (
+            f"Video is {duration:.1f}s, shorter than the {min_sec}s Track 2 minimum. "
+            "Processing will continue, but this clip does not meet the compliance window."
+        )
+    if duration > max_sec:
+        return True, (
+            f"Video is {duration:.1f}s, exceeding the {max_sec}s Track 2 cap. "
+            f"Only the first {max_sec}s will be processed."
+        )
+    return True, None
+
+
+def validate_duration(
+    video_path: str | Path, min_sec: int = 30, max_sec: int = 120
+) -> tuple[bool, str | None]:
+    """Validate a video file's duration against the Track 2 compliance window."""
+    video_path = Path(video_path)
+    if not video_path.exists():
+        return False, f"Video file not found: {video_path}"
+
+    duration, error = _clip_duration(video_path)
+    if error or duration is None:
+        return False, f"Could not determine video duration: {error}"
+
+    return duration_verdict(duration, min_sec=min_sec, max_sec=max_sec)
 
 
 def cleanup_audio_file(audio_path: str | None) -> None:
@@ -144,8 +218,6 @@ def extract_midpoint_frame(
     """
     try:
         from moviepy.editor import VideoFileClip
-        from PIL import Image
-        import numpy as np
 
         video_path = Path(video_path)
         if not video_path.exists():
@@ -156,20 +228,7 @@ def extract_midpoint_frame(
             clip = VideoFileClip(str(video_path))
             if clip.duration is None or clip.duration <= 0:
                 return None, "Video has zero or unknown duration; cannot extract midpoint frame."
-
-            midpoint = clip.duration / 2.0
-            frame: np.ndarray = clip.get_frame(midpoint)  # shape (H, W, 3), dtype uint8
-
-            image = Image.fromarray(frame, mode="RGB")
-            output_image_path = Path(output_image_path)
-            output_image_path.parent.mkdir(parents=True, exist_ok=True)
-            image.save(str(output_image_path), format="JPEG", quality=85)
-
-            logger.info(
-                "Midpoint frame (t=%.2fs) saved to %s", midpoint, output_image_path
-            )
-            return str(output_image_path), None
-
+            return _save_frame_at(clip, clip.duration / 2.0, output_image_path)
         finally:
             if clip is not None:
                 clip.close()
@@ -177,3 +236,71 @@ def extract_midpoint_frame(
     except Exception as exc:
         logger.warning("extract_midpoint_frame failed for %s: %s", video_path, exc)
         return None, f"Frame extraction failed: {exc}"
+
+
+def _save_frame_at(clip, timestamp: float, output_image_path: str | Path) -> tuple[str | None, str | None]:
+    """Grab the frame at *timestamp* from an already-open MoviePy clip and save it as JPEG."""
+    from PIL import Image
+    import numpy as np
+
+    frame: np.ndarray = clip.get_frame(timestamp)  # shape (H, W, 3), dtype uint8
+    image = Image.fromarray(frame, mode="RGB")
+    output_image_path = Path(output_image_path)
+    output_image_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(str(output_image_path), format="JPEG", quality=85)
+    logger.info("Frame (t=%.2fs) saved to %s", timestamp, output_image_path)
+    return str(output_image_path), None
+
+
+def extract_sample_frames(
+    video_path: str | Path,
+    num_frames: int = 3,
+) -> list[str]:
+    """
+    Sample up to *num_frames* evenly-spaced frames across the video (skipping
+    the very first/last instant) and save each as a temp JPEG.
+
+    Used for always-on visual grounding: even when speech transcription
+    succeeds, a few sampled frames let the vision model verify/ground the
+    caption content in what's actually on screen, not just what's said.
+
+    Returns a list of temp file paths (possibly shorter than num_frames, or
+    empty on failure). Caller is responsible for deleting the returned files
+    via cleanup_audio_file/cleanup_temp_files.
+    """
+    from moviepy.editor import VideoFileClip
+
+    video_path = Path(video_path)
+    if not video_path.exists() or num_frames <= 0:
+        return []
+
+    clip = None
+    saved: list[str] = []
+    try:
+        clip = VideoFileClip(str(video_path))
+        if clip.duration is None or clip.duration <= 0:
+            return []
+
+        # Evenly spaced timestamps strictly inside (0, duration), avoiding
+        # black frames at the very start/end of the clip.
+        fraction_step = 1.0 / (num_frames + 1)
+        timestamps = [clip.duration * fraction_step * (i + 1) for i in range(num_frames)]
+
+        for ts in timestamps:
+            fd, frame_path = tempfile.mkstemp(suffix=".jpg")
+            os.close(fd)
+            path, err = _save_frame_at(clip, ts, frame_path)
+            if path:
+                saved.append(path)
+            else:
+                logger.warning("Sample frame at t=%.2fs failed: %s", ts, err)
+                cleanup_audio_file(frame_path)
+        return saved
+    except Exception as exc:
+        logger.warning("extract_sample_frames failed for %s: %s", video_path, exc)
+        for path in saved:
+            cleanup_audio_file(path)
+        return []
+    finally:
+        if clip is not None:
+            clip.close()

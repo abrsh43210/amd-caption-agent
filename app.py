@@ -7,14 +7,15 @@ Streamlit dashboard for MP4 upload, audio extraction, and multi-agent caption ge
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 import time
 import traceback
-from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from audio_transcriber import transcribe_audio
+from audio_transcriber import get_visual_context, transcribe_with_vision_fallback
 from pipeline import (
     SERVERLESS_MODELS,
     build_client,
@@ -23,8 +24,15 @@ from pipeline import (
     resolve_fireworks_api_key,
     run_caption_critic_loop,
 )
-from schemas import CriticEvaluation
-from video_processor import cleanup_temp_files, safe_extract_audio
+from schemas import CriticEvaluation, TelemetrySummary
+from video_processor import cleanup_temp_files, validate_duration
+
+_BACKEND_LABELS = {
+    "fireworks-whisper-v3": "Fireworks Whisper-v3",
+    "local-whisper-base": "local Whisper (CPU)",
+    "vision-fallback": "vision fallback (LLaMA Vision on midpoint frame)",
+    "static-baseline": "static silent-video baseline",
+}
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -306,38 +314,33 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
         st.stop()
 
     transcript = manual_transcript.strip()
-    audio_path: str | None = None
+    video_path: str | None = None
     video_name = "demo.mp4"
     context: str | None = None
     evaluation: CriticEvaluation | None = None
+    telemetry = TelemetrySummary()
+    stage_times: dict[str, float] = {}
 
     try:
         with st.status("Pipeline progress", expanded=True) as status:
-            # Step 1 — Extract audio
+            # Step 1 — Prepare video & validate duration
+            _t0 = time.perf_counter()
             try:
-                st.write("**[1/5] Extracting audio…**")
+                st.write("**[1/5] Preparing video…**")
                 if uploaded is not None and not manual_transcript.strip():
                     video_name = uploaded.name
                     video_bytes = uploaded.read()
-                    audio_path, audio_error = safe_extract_audio(video_bytes)
-                    if audio_error:
-                        st.warning(f"Audio issue: {audio_error}")
-                        if not transcript:
-                            if use_mock:
-                                transcript = mock_transcript(video_name)
-                                st.info("Using mock transcript for testing.")
-                            else:
-                                st.error(
-                                    "No usable audio and no manual transcript. "
-                                    "Enable mock transcript or paste text in the sidebar."
-                                )
-                                status.update(label="Pipeline failed", state="error")
-                                st.stop()
-                    elif audio_path:
-                        st.success(f"Audio extracted ({Path(audio_path).stat().st_size // 1024} KB MP3).")
+                    fd, video_path = tempfile.mkstemp(suffix=".mp4")
+                    with os.fdopen(fd, "wb") as video_file:
+                        video_file.write(video_bytes)
+
+                    is_valid, duration_msg = validate_duration(video_path)
+                    if duration_msg:
+                        st.warning(duration_msg)
+                    st.success(f"Video ready ({len(video_bytes) // 1024} KB).")
                 elif uploaded is not None and manual_transcript.strip():
                     video_name = uploaded.name
-                    st.info("Skipping audio extraction — using manual transcript override.")
+                    st.info("Skipping video processing — using manual transcript override.")
                 elif use_mock or transcript:
                     if not transcript:
                         transcript = mock_transcript(video_name)
@@ -351,55 +354,21 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
                 st.code(traceback.format_exc())
                 status.update(label="Pipeline failed at step 1", state="error")
                 st.stop()
+            stage_times["extract"] = time.perf_counter() - _t0
 
-            # Step 2 — Transcribe audio via Whisper-v3
+            # Step 2 — Transcribe (Whisper with vision/static-baseline fallback)
+            _t0 = time.perf_counter()
             try:
-                if audio_path and not transcript:
-                    st.write("**[2/5] 🎵 Transcribing audio via Whisper…**")
+                if video_path and not transcript:
+                    st.write("**[2/5] 🎵 Transcribing (Whisper + vision fallback)…**")
                     try:
-                        # --- Primary: Fireworks cloud Whisper ---
-                        from audio_transcriber import (
-                            _fireworks_audio_unavailable,
-                            _resolve_api_key,
-                            transcribe_with_fireworks,
-                            transcribe_with_local_whisper,
+                        transcript, stt_backend = transcribe_with_vision_fallback(video_path, api_key)
+                        if not transcript:
+                            raise ValueError("Transcription returned an empty result.")
+                        st.success(
+                            f"Transcription complete ({len(transcript.split())} words) "
+                            f"via **{_BACKEND_LABELS.get(stt_backend, stt_backend)}**."
                         )
-                        resolved_key = _resolve_api_key(api_key)
-                        try:
-                            transcript = transcribe_with_fireworks(
-                                audio_path, api_key=resolved_key
-                            )
-                            stt_backend = "fireworks-whisper-v3"
-                            if not transcript:
-                                raise ValueError("Fireworks Whisper returned an empty transcript.")
-                        except Exception as fw_exc:
-                            if not _fireworks_audio_unavailable(fw_exc):
-                                # Hard failure — not a connection/auth/deprecation issue
-                                raise RuntimeError(f"Speech-to-text failed: {fw_exc}") from fw_exc
-
-                            # --- Fallback: local faster-whisper on CPU ---
-                            logger.warning(
-                                "Fireworks audio unavailable (%s) — routing to local Whisper.",
-                                fw_exc,
-                            )
-                            _t0 = time.perf_counter()
-                            transcript = transcribe_with_local_whisper(audio_path)
-                            _elapsed = time.perf_counter() - _t0
-                            stt_backend = "local-whisper-base"
-                            if not transcript:
-                                raise ValueError("Local Whisper returned an empty transcript.")
-
-                        if transcript:
-                            st.success(
-                                f"Transcription complete ({len(transcript.split())} words) "
-                                f"via **{stt_backend}**."
-                            )
-                            if stt_backend == "local-whisper-base":
-                                st.info(
-                                    "Fireworks serverless audio was unavailable — "
-                                    "used local Whisper on CPU instead. "
-                                    f"⏱ Execution time: **{_elapsed:.1f}s**"
-                                )
                     except Exception as exc:
                         st.warning(f"Transcription failed: {exc}")
                         if use_mock:
@@ -412,50 +381,62 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
                             )
                             status.update(label="Pipeline failed", state="error")
                             st.stop()
-                    finally:
-                        cleanup_temp_files(audio_path)
-                        audio_path = None
                 elif transcript:
-                    st.write("**[2/5] 🎵 Transcribing audio via Whisper…**")
+                    st.write("**[2/5] 🎵 Transcribing (Whisper + vision fallback)…**")
                     st.info("Skipped — using manual transcript override.")
                 else:
-                    st.write("**[2/5] 🎵 Transcribing audio via Whisper…**")
-                    st.info("Skipped — no audio file to transcribe.")
+                    st.write("**[2/5] 🎵 Transcribing (Whisper + vision fallback)…**")
+                    st.info("Skipped — no video to transcribe.")
             except Exception as e:
                 st.error(f"Error details: {str(e)}")
                 st.code(traceback.format_exc())
                 status.update(label="Pipeline failed at step 2", state="error")
                 st.stop()
+            stage_times["transcribe"] = time.perf_counter() - _t0
 
-
-            # Step 3 — Analyze context
+            # Step 3 — Analyze context (transcript + always-on visual grounding)
+            _t0 = time.perf_counter()
+            visual_context: str | None = None
             try:
-                st.write("**[3/5] Analyzing context…**")
+                st.write("**[3/5] Analyzing context (audio + visual grounding)…**")
+                if video_path:
+                    visual_context = get_visual_context(video_path, api_key)
+                    if visual_context:
+                        st.caption("🖼️ Visual grounding: sampled frames analyzed and fused into context.")
+                    else:
+                        st.caption("🖼️ Visual grounding unavailable for this video; using transcript only.")
                 client = build_client(api_key)
-                context = generate_raw_context(transcript, client=client, model=model)
+                context, context_telemetry = generate_raw_context(
+                    transcript, client=client, model=model, visual_context=visual_context
+                )
+                telemetry += context_telemetry
                 st.success("Context analysis complete.")
             except Exception as e:
                 st.error(f"Error details: {str(e)}")
                 st.code(traceback.format_exc())
                 status.update(label="Pipeline failed at step 3", state="error")
                 st.stop()
+            stage_times["context"] = time.perf_counter() - _t0
 
             # Step 4 — Style agents + critic loop
+            _t0 = time.perf_counter()
             try:
                 st.write("**[4/5] Orchestrating style agents…**")
-                evaluation = run_caption_critic_loop(
+                evaluation, critic_telemetry = run_caption_critic_loop(
                     transcript,
                     context,
                     client=client,
                     model=model,
                     max_retries=max_retries,
                 )
+                telemetry += critic_telemetry
                 st.success("Four copywriter personas drafted captions.")
             except Exception as e:
                 st.error(f"Error details: {str(e)}")
                 st.code(traceback.format_exc())
                 status.update(label="Pipeline failed at step 4", state="error")
                 st.stop()
+            stage_times["generate_critic"] = time.perf_counter() - _t0
 
             # Step 5 — Critic verification
             try:
@@ -477,18 +458,32 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
             st.caption(f"{len(transcript.split())} words · {len(transcript)} characters")
             st.code(transcript, language=None)
 
+        if visual_context:
+            with st.expander("Visual grounding (sampled frames)", expanded=False):
+                st.markdown(visual_context)
+
         with st.expander("Context analysis", expanded=False):
             st.markdown(context)
 
         st.markdown("### Generated Captions")
         render_results(evaluation)
 
+        st.markdown("#### Telemetry")
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Total tokens", f"{telemetry.total_tokens:,}")
+        metric_cols[1].metric("Prompt tokens", f"{telemetry.prompt_tokens:,}")
+        metric_cols[2].metric("Completion tokens", f"{telemetry.completion_tokens:,}")
+        metric_cols[3].metric("API calls", telemetry.calls)
+        st.caption(
+            " · ".join(f"{stage}: {elapsed:.1f}s" for stage, elapsed in stage_times.items())
+        )
+
     except Exception as exc:
         logger.exception("Pipeline error")
         st.error(f"Error details: {str(exc)}")
         st.code(traceback.format_exc())
     finally:
-        cleanup_temp_files(audio_path)
+        cleanup_temp_files(video_path)
 
 else:
     st.info("Upload an MP4 and click **Generate Captions** to begin.")
@@ -497,10 +492,10 @@ else:
     st.markdown("#### How it works")
     st.markdown(
         """
-        1. **Extract audio** from your MP4 with MoviePy (MP3)
-        2. **Transcribe & Analyze Vision**: Transcribe speech via Whisper (Fireworks/local fallback). If the video is silent, we automatically extract a midpoint keyframe and use Fireworks LLaMA Vision to describe the scene.
-        3. **Analyze context** — themes, mood, and technical jargon
+        1. **Prepare video** — validate duration against Track 2's 30s-2min window (over-long clips are auto-truncated to the first 2 minutes)
+        2. **Transcribe & Analyze Vision**: Transcribe speech via Whisper (Fireworks/local fallback). If the video is silent, we automatically extract a midpoint keyframe and use Fireworks LLaMA Vision to describe the scene, falling back to a static baseline caption if that fails too.
+        3. **Analyze context (audio + vision fusion)** — themes, mood, and technical jargon from the transcript, always fused with a Vision-LLM description of frames sampled across the *whole* video — so captions are grounded in what's actually shown, not just what's said, even when speech transcription succeeds
         4. **Orchestrate agents** — Formal, Sarcastic, Humorous-Tech, Humorous-Non-Tech
-        5. **Critic loop** — automated quality gate with up to 3 self-correction passes
+        5. **Critic loop** — automated quality gate (LLM critic + embedding-based distinctness check) with up to 3 self-correction passes
         """
     )

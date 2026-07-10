@@ -1,5 +1,9 @@
 """Pydantic schemas for structured caption and critic outputs."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 from pydantic import BaseModel, Field
 
 
@@ -22,3 +26,33 @@ class CriticEvaluation(BaseModel):
     )
     critique_notes: str = Field(..., description="Detailed feedback on caption quality and tone.")
     approved: bool = Field(..., description="Whether all captions meet quality and tonal standards.")
+
+
+@dataclass
+class TelemetrySummary:
+    """Accumulated token-usage telemetry across one or more Fireworks API calls."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    calls: int = 0
+
+    def add_usage(self, usage: object | None) -> None:
+        """Add one response's `usage` object (or dict) to the running totals."""
+        if usage is None:
+            return
+        if isinstance(usage, dict):
+            get = usage.get
+        else:
+            get = lambda k: getattr(usage, k, None)  # noqa: E731
+        self.prompt_tokens += get("prompt_tokens") or 0
+        self.completion_tokens += get("completion_tokens") or 0
+        self.total_tokens += get("total_tokens") or 0
+        self.calls += 1
+
+    def __iadd__(self, other: "TelemetrySummary") -> "TelemetrySummary":
+        self.prompt_tokens += other.prompt_tokens
+        self.completion_tokens += other.completion_tokens
+        self.total_tokens += other.total_tokens
+        self.calls += other.calls
+        return self
