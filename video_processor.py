@@ -221,6 +221,10 @@ def download_video(url: str, max_bytes: int = 500 * 1024 * 1024) -> str:
         "quiet": True,
         "no_warnings": True,
         "max_filesize": max_bytes,
+        # YouTube's default (web) client frequently fails to return playable
+        # formats ("The page needs to be reloaded" / SABR streaming errors).
+        # The android/ios clients still work without needing a PO token.
+        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
     }
 
     try:

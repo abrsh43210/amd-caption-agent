@@ -553,26 +553,52 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
 st.markdown("---")
 st.markdown("### 🔗 Batch: YouTube / Video Links")
 st.caption(
-    "Paste one or more YouTube links or direct video URLs (one per line). "
-    "Each is downloaded and run through the full pipeline independently."
-)
-links_input = st.text_area(
-    "Video links",
-    height=100,
-    placeholder="https://www.youtube.com/watch?v=...\nhttps://example.com/clip.mp4",
-    key="batch_links",
-    label_visibility="collapsed",
+    "Add one or more YouTube links or direct video URLs. Each is downloaded "
+    "and run through the full pipeline independently."
 )
 
 MAX_BATCH_LINKS = 5
+if "link_count" not in st.session_state:
+    st.session_state.link_count = 1
 
-if st.button("Process Links", disabled=not links_input.strip()):
+for i in range(st.session_state.link_count):
+    col_link, col_remove = st.columns([10, 1])
+    with col_link:
+        st.text_input(
+            f"Video link {i + 1}",
+            key=f"link_{i}",
+            placeholder="https://www.youtube.com/watch?v=... or https://example.com/clip.mp4",
+            label_visibility="collapsed" if i > 0 else "visible",
+        )
+    with col_remove:
+        if st.session_state.link_count > 1 and st.button("✕", key=f"remove_link_{i}"):
+            st.session_state.link_count -= 1
+            for j in range(i, st.session_state.link_count):
+                st.session_state[f"link_{j}"] = st.session_state.get(f"link_{j + 1}", "")
+            del st.session_state[f"link_{st.session_state.link_count}"]
+            st.rerun()
+
+col_add, col_process = st.columns([1, 3])
+with col_add:
+    if st.button("+ Add another link", disabled=st.session_state.link_count >= MAX_BATCH_LINKS):
+        st.session_state.link_count += 1
+        st.rerun()
+
+link_values = [
+    st.session_state.get(f"link_{i}", "").strip() for i in range(st.session_state.link_count)
+]
+links_ready = any(link_values)
+
+with col_process:
+    process_clicked = st.button("Process Links", type="primary", disabled=not links_ready)
+
+if process_clicked:
     batch_api_key = st.session_state.get("fireworks_api_key") or resolve_api_key(api_key_input)
     if not batch_api_key or not batch_api_key.startswith("fw_"):
         st.error("Please provide a valid Fireworks API key (starts with `fw_`) before processing links.")
         st.stop()
 
-    urls = list(dict.fromkeys(u.strip() for u in links_input.splitlines() if u.strip()))
+    urls = list(dict.fromkeys(u for u in link_values if u))
     if len(urls) > MAX_BATCH_LINKS:
         st.warning(f"Only the first {MAX_BATCH_LINKS} links will be processed in this batch.")
         urls = urls[:MAX_BATCH_LINKS]
@@ -624,7 +650,7 @@ if st.button("Process Links", disabled=not links_input.strip()):
                     + " · ".join(f"{stage}: {elapsed:.1f}s" for stage, elapsed in result["stage_times"].items())
                 )
 
-if not (uploaded or use_mock or manual_transcript.strip() or links_input.strip()):
+if not (uploaded or use_mock or manual_transcript.strip() or links_ready):
     st.info("Upload an MP4, paste video links above, or click **Generate Captions** to begin.")
 
     st.markdown("---")
