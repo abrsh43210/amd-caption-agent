@@ -25,7 +25,7 @@ from pipeline import (
     run_caption_critic_loop,
 )
 from schemas import CriticEvaluation, TelemetrySummary
-from video_processor import cleanup_temp_files, validate_duration
+from video_processor import cleanup_temp_files, download_video, validate_duration
 
 _BACKEND_LABELS = {
     "fireworks-whisper-v3": "Fireworks Whisper-v3",
@@ -247,6 +247,71 @@ def render_results(evaluation: CriticEvaluation) -> None:
         unsafe_allow_html=True,
     )
 
+
+
+def process_pipeline(
+    *,
+    video_path: str | None,
+    video_name: str,
+    transcript_override: str,
+    use_mock: bool,
+    api_key: str,
+    model: str,
+    max_retries: int,
+) -> dict:
+    """
+    Run transcription (+ always-on visual grounding), context analysis, and
+    the critic loop for one video or transcript. Used by the batch-links
+    section so each link gets an independent, isolated pipeline run.
+
+    Raises on unrecoverable failure (empty transcript with no mock/manual
+    fallback, API errors, etc.) — callers should catch per-item.
+    """
+    telemetry = TelemetrySummary()
+    stage_times: dict[str, float] = {}
+    transcript = transcript_override.strip()
+    stt_backend: str | None = None
+    visual_context: str | None = None
+
+    _t0 = time.perf_counter()
+    if video_path and not transcript:
+        transcript, stt_backend = transcribe_with_vision_fallback(video_path, api_key)
+        if not transcript:
+            if use_mock:
+                transcript = mock_transcript(video_name)
+            else:
+                raise RuntimeError("Transcription returned an empty result.")
+    elif not transcript and use_mock:
+        transcript = mock_transcript(video_name)
+    stage_times["transcribe"] = time.perf_counter() - _t0
+
+    _t0 = time.perf_counter()
+    if video_path:
+        visual_context = get_visual_context(video_path, api_key)
+    client = build_client(api_key)
+    context, context_telemetry = generate_raw_context(
+        transcript, client=client, model=model, visual_context=visual_context
+    )
+    telemetry += context_telemetry
+    stage_times["context"] = time.perf_counter() - _t0
+
+    _t0 = time.perf_counter()
+    evaluation, critic_telemetry = run_caption_critic_loop(
+        transcript, context, client=client, model=model, max_retries=max_retries
+    )
+    telemetry += critic_telemetry
+    stage_times["generate_critic"] = time.perf_counter() - _t0
+
+    return {
+        "video_name": video_name,
+        "transcript": transcript,
+        "stt_backend": stt_backend,
+        "visual_context": visual_context,
+        "context": context,
+        "evaluation": evaluation,
+        "telemetry": telemetry,
+        "stage_times": stage_times,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -485,8 +550,82 @@ if st.button("Generate Captions", type="primary", disabled=not (uploaded or use_
     finally:
         cleanup_temp_files(video_path)
 
-else:
-    st.info("Upload an MP4 and click **Generate Captions** to begin.")
+st.markdown("---")
+st.markdown("### 🔗 Batch: YouTube / Video Links")
+st.caption(
+    "Paste one or more YouTube links or direct video URLs (one per line). "
+    "Each is downloaded and run through the full pipeline independently."
+)
+links_input = st.text_area(
+    "Video links",
+    height=100,
+    placeholder="https://www.youtube.com/watch?v=...\nhttps://example.com/clip.mp4",
+    key="batch_links",
+    label_visibility="collapsed",
+)
+
+MAX_BATCH_LINKS = 5
+
+if st.button("Process Links", disabled=not links_input.strip()):
+    batch_api_key = st.session_state.get("fireworks_api_key") or resolve_api_key(api_key_input)
+    if not batch_api_key or not batch_api_key.startswith("fw_"):
+        st.error("Please provide a valid Fireworks API key (starts with `fw_`) before processing links.")
+        st.stop()
+
+    urls = list(dict.fromkeys(u.strip() for u in links_input.splitlines() if u.strip()))
+    if len(urls) > MAX_BATCH_LINKS:
+        st.warning(f"Only the first {MAX_BATCH_LINKS} links will be processed in this batch.")
+        urls = urls[:MAX_BATCH_LINKS]
+
+    for idx, url in enumerate(urls, start=1):
+        dl_path: str | None = None
+        result: dict | None = None
+        with st.status(f"[{idx}/{len(urls)}] {url}", expanded=True) as link_status:
+            try:
+                st.write("Downloading video…")
+                dl_path = download_video(url)
+                is_valid, duration_msg = validate_duration(dl_path)
+                if duration_msg:
+                    st.warning(duration_msg)
+
+                st.write("Transcribing, grounding in visual frames, analyzing context, orchestrating agents…")
+                result = process_pipeline(
+                    video_path=dl_path,
+                    video_name=url,
+                    transcript_override="",
+                    use_mock=use_mock,
+                    api_key=batch_api_key,
+                    model=model,
+                    max_retries=max_retries,
+                )
+                link_status.update(label=f"✓ {url}", state="complete")
+            except Exception as exc:
+                logger.exception("Batch link failed: %s", url)
+                link_status.update(label=f"✗ Failed — {url}", state="error")
+                st.error(f"Error details: {str(exc)}")
+            finally:
+                cleanup_temp_files(dl_path)
+
+        if result is not None:
+            with st.expander(f"Results — {url}", expanded=True):
+                backend_note = (
+                    f" · via **{_BACKEND_LABELS.get(result['stt_backend'], result['stt_backend'])}**"
+                    if result["stt_backend"]
+                    else ""
+                )
+                st.caption(f"{len(result['transcript'].split())} words{backend_note}")
+                if result["visual_context"]:
+                    with st.expander("Visual grounding (sampled frames)", expanded=False):
+                        st.markdown(result["visual_context"])
+                render_results(result["evaluation"])
+                t = result["telemetry"]
+                st.caption(
+                    f"Tokens: {t.total_tokens:,} total ({t.calls} API calls) · "
+                    + " · ".join(f"{stage}: {elapsed:.1f}s" for stage, elapsed in result["stage_times"].items())
+                )
+
+if not (uploaded or use_mock or manual_transcript.strip() or links_input.strip()):
+    st.info("Upload an MP4, paste video links above, or click **Generate Captions** to begin.")
 
     st.markdown("---")
     st.markdown("#### How it works")

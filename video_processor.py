@@ -198,6 +198,48 @@ def cleanup_temp_files(*paths: str | None) -> None:
         cleanup_audio_file(path)
 
 
+def download_video(url: str, max_bytes: int = 500 * 1024 * 1024) -> str:
+    """
+    Download a video from a YouTube link or a direct video file URL to a temp
+    MP4 file using yt-dlp (which also handles plain file URLs via its
+    generic extractor).
+
+    Returns the path to the downloaded MP4. Caller is responsible for
+    cleanup via cleanup_audio_file/cleanup_temp_files.
+    """
+    import yt_dlp
+
+    fd, path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    os.remove(path)  # yt-dlp writes to this exact path via outtmpl
+
+    ydl_opts = {
+        "format": "mp4/best[ext=mp4]/best",
+        "outtmpl": path,
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "max_filesize": max_bytes,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise RuntimeError(f"Failed to download video from {url}: {exc}") from exc
+
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"Download produced no output file for {url}")
+
+    return path
+
+
 def extract_midpoint_frame(
     video_path: str | Path,
     output_image_path: str | Path,
