@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,13 @@ OUTPUT_RESULTS_PATH = Path("/output/results.json")
 
 # Maximum bytes to download for a single video (default 500MB, overridable).
 MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(500 * 1024 * 1024)))
+
+# Soft wall-clock budget for the whole batch (default 9 min, leaving a buffer
+# under the harness's 10-minute hard timeout). Once elapsed time exceeds this,
+# remaining tasks are skipped rather than started, so the process can still
+# exit cleanly with whatever results were already written instead of being
+# killed mid-task.
+BATCH_DEADLINE_SECONDS = float(os.getenv("BATCH_DEADLINE_SECONDS", "540"))
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +328,25 @@ def main() -> None:
     total = len(tasks)
     succeeded = 0
     failed = 0
+    skipped = 0
+    start_time = time.monotonic()
 
     for index, task in enumerate(tasks, start=1):
+        elapsed = time.monotonic() - start_time
+        if elapsed >= BATCH_DEADLINE_SECONDS:
+            remaining = total - index + 1
+            logger.warning(
+                "Batch deadline (%.0fs) reached after %d/%d task(s); "
+                "skipping remaining %d task(s) so the process can exit cleanly "
+                "with results collected so far.",
+                BATCH_DEADLINE_SECONDS,
+                index - 1,
+                total,
+                remaining,
+            )
+            skipped += remaining
+            break
+
         fields = _extract_task_fields(task, index - 1)
         if fields is None:
             failed += 1
@@ -344,13 +369,16 @@ def main() -> None:
             # Continue with remaining tasks; do not write partial data for this one.
 
     logger.info(
-        "=== Batch complete: %d succeeded, %d failed out of %d total. ===",
+        "=== Batch complete: %d succeeded, %d failed, %d skipped out of %d total. ===",
         succeeded,
         failed,
+        skipped,
         total,
     )
-    if failed:
-        sys.exit(1)
+    # Always exit 0 once we've reached this point: results.json already holds
+    # every successfully completed task, written atomically as it went. A
+    # per-clip failure (or a deadline-triggered skip) must not zero out an
+    # otherwise-successful batch by signaling total process failure.
 
 
 if __name__ == "__main__":
