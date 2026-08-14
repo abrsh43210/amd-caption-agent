@@ -8,10 +8,10 @@
 set -euo pipefail
 
 if [ -f "/input/tasks.json" ]; then
-    echo "[entrypoint] /input/tasks.json detected – starting headless batch mode."
+    echo "[entrypoint] /input/tasks.json detected – starting headless batch mode." >&2
     exec python run_headless.py
 else
-    echo "[entrypoint] No /input/tasks.json found – starting Streamlit dashboard."
+    echo "[entrypoint] No /input/tasks.json found – starting Streamlit dashboard." >&2
     exec streamlit run app.py \
         --server.address 0.0.0.0 \
         --server.port 8501
